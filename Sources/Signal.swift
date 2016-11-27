@@ -42,9 +42,6 @@ public final class Signal<Value, Error: Swift.Error> {
 	/// Used to ensure that state updates are serialized.
 	private let updateLock: NSLock
 
-	/// Used to ensure that events are serialized during delivery to observers.
-	private let sendLock: NSLock
-
 	/// Initialize a Signal that will immediately invoke the given generator,
 	/// then forward events sent to the given observer.
 	///
@@ -55,178 +52,215 @@ public final class Signal<Value, Error: Swift.Error> {
 	/// - parameters:
 	///   - generator: A closure that accepts an implicitly created observer
 	///                that will act as an event emitter for the signal.
-	public init(_ generator: (Observer) -> Disposable?) {
+	public convenience init(_ generator: (Observer) -> Disposable?) {
+	self.init(serialization: .serialize, generator)
+	}
+
+	internal init(serialization: SignalSerialization, _ generator: (Observer) -> Disposable?) {
 		state = .alive(AliveState())
 		updateLock = NSLock()
 		updateLock.name = "org.reactivecocoa.ReactiveSwift.Signal.updateLock"
-		sendLock = NSLock()
-		sendLock.name = "org.reactivecocoa.ReactiveSwift.Signal.sendLock"
 
-		let observer = Observer { [weak self] event in
-			guard let signal = self else {
-				return
-			}
+		let observer: Observer
 
-			// Thread Safety Notes on `Signal.state`.
-			//
-			// - Check if the signal is at a specific state.
-			//
-			//   Read directly.
-			//
-			// - Deliver `value` events with the alive state.
-			//
-			//   `sendLock` must be acquired.
-			//
-			// - Replace the alive state with another.
-			//   (e.g. observers bag manipulation)
-			//
-			//   `updateLock` must be acquired.
-			//
-			// - Transition from `alive` to `terminating` as a result of receiving
-			//   a termination event.
-			//
-			//   `updateLock` must be acquired, and should fail gracefully if the
-			//   signal has terminated.
-			//
-			// - Check if the signal is terminating. If it is, invoke `tryTerminate`
-			//   which transitions the state from `terminating` to `terminated`, and
-			//   delivers the termination event.
-			//
-			//   Both `sendLock` and `updateLock` must be acquired. The check can be
-			//   relaxed, but the state must be checked again after the locks are
-			//   acquired. Fail gracefully if the state has changed since the relaxed
-			//   read, i.e. a concurrent sender has already handled the termination
-			//   event.
-			//
-			// Exploiting the relaxation of reads, please note that false positives
-			// are intentionally allowed in the `terminating` checks below. As a
-			// result, normal event deliveries need not acquire `updateLock`.
-			// Nevertheless, this should not cause the termination event being
-			// sent multiple times, since `tryTerminate` would not respond to false
-			// positives.
-
-			/// Try to terminate the signal.
-			///
-			/// If the signal is alive or has terminated, it fails gracefully. In
-			/// other words, calling this method as a result of a false positive
-			/// `terminating` check is permitted.
-			///
-			/// - note: The `updateLock` would be acquired.
-			///
-			/// - returns: `true` if the attempt succeeds. `false` otherwise.
-			@inline(__always)
-			func tryTerminate() -> Bool {
-				// Acquire `updateLock`. If the termination has still not yet been
-				// handled, take it over and bump the status to `terminated`.
-				signal.updateLock.lock()
-
-				if case let .terminating(state) = signal.state {
-					signal.state = .terminated
-					signal.updateLock.unlock()
-
-					for observer in state.observers {
-						observer.action(state.event)
-					}
-
-					return true
+		switch serialization {
+		case .inherit:
+			observer = Observer { [weak self] event in
+				guard let signal = self else {
+					return
 				}
 
-				signal.updateLock.unlock()
-				return false
-			}
+				if event.isTerminating {
+					if case let .alive(state) = signal.state {
+						signal.updateLock.lock()
+						signal.state = .terminated
+						signal.updateLock.unlock()
 
-			if event.isTerminating {
-				// Recursive events are disallowed for `value` events, but are permitted
-				// for termination events. Specifically:
-				//
-				// - `interrupted`
-				// It can inadvertently be sent by downstream consumers as part of the
-				// `SignalProducer` mechanics.
-				//
-				// - `completed`
-				// If a downstream consumer weakly references an object, invocation of
-				// such consumer may cause a race condition with its weak retain against
-				// the last strong release of the object. If the `Lifetime` of the
-				// object is being referenced by an upstream `take(during:)`, a
-				// signal recursion might occur.
-				//
-				// So we would treat termination events specially. If it happens to
-				// occur while the `sendLock` is acquired, the observer call-out and
-				// the disposal would be delegated to the current sender, or
-				// occasionally one of the senders waiting on `sendLock`.
-				signal.updateLock.lock()
-
-				if case let .alive(state) = signal.state {
-					let newSnapshot = TerminatingState(observers: state.observers,
-					                                   event: event)
-					signal.state = .terminating(newSnapshot)
-					signal.updateLock.unlock()
-
-					if signal.sendLock.try() {
-						// Check whether the terminating state has been handled by a
-						// concurrent sender. If not, handle it.
-						let shouldDispose = tryTerminate()
-						signal.sendLock.unlock()
-
-						if shouldDispose {
-							signal.swapDisposable()?.dispose()
+						for observer in state.observers {
+							observer.action(event)
 						}
+
+						signal.swapDisposable()?.dispose()
 					}
 				} else {
-					signal.updateLock.unlock()
-				}
-			} else {
-				var shouldDispose = false
-
-				// The `terminating` status check is performed twice for two different
-				// purposes:
-				//
-				// 1. Within the main protected section
-				//    It guarantees that a recursive termination event sent by a
-				//    downstream consumer, is immediately processed and need not compete
-				//    with concurrent pending senders (if any).
-				//
-				//    Termination events sent concurrently may also be caught here, but
-				//    not necessarily all of them due to data races.
-				//
-				// 2. After the main protected section
-				//    It ensures the termination event sent concurrently that are not
-				//    caught by (1) due to data races would still be processed.
-				//
-				// The related PR on the race conditions:
-				// https://github.com/ReactiveCocoa/ReactiveSwift/pull/112
-
-				signal.sendLock.lock()
-				// Start of the main protected section.
-
-				if case let .alive(state) = signal.state {
-					for observer in state.observers {
-						observer.action(event)
+					if case let .alive(state) = signal.state {
+						for observer in state.observers {
+							observer.action(event)
+						}
 					}
+				}
+			}
+
+		case .serialize:
+			let sendLock = NSLock()
+			sendLock.name = "org.reactivecocoa.ReactiveSwift.Signal.sendLock"
+
+			observer = Observer { [sendLock, weak self] event in
+				guard let signal = self else {
+					return
+				}
+
+				// Thread Safety Notes on `Signal.state`.
+				//
+				// - Check if the signal is at a specific state.
+				//
+				//   Read directly.
+				//
+				// - Deliver `value` events with the alive state.
+				//
+				//   `sendLock` must be acquired.
+				//
+				// - Replace the alive state with another.
+				//   (e.g. observers bag manipulation)
+				//
+				//   `updateLock` must be acquired.
+				//
+				// - Transition from `alive` to `terminating` as a result of receiving
+				//   a termination event.
+				//
+				//   `updateLock` must be acquired, and should fail gracefully if the
+				//   signal has terminated.
+				//
+				// - Check if the signal is terminating. If it is, invoke `tryTerminate`
+				//   which transitions the state from `terminating` to `terminated`, and
+				//   delivers the termination event.
+				//
+				//   Both `sendLock` and `updateLock` must be acquired. The check can be
+				//   relaxed, but the state must be checked again after the locks are
+				//   acquired. Fail gracefully if the state has changed since the relaxed
+				//   read, i.e. a concurrent sender has already handled the termination
+				//   event.
+				//
+				// Exploiting the relaxation of reads, please note that false positives
+				// are intentionally allowed in the `terminating` checks below. As a
+				// result, normal event deliveries need not acquire `updateLock`.
+				// Nevertheless, this should not cause the termination event being
+				// sent multiple times, since `tryTerminate` would not respond to false
+				// positives.
+
+				/// Try to terminate the signal.
+				///
+				/// If the signal is alive or has terminated, it fails gracefully. In
+				/// other words, calling this method as a result of a false positive
+				/// `terminating` check is permitted.
+				///
+				/// - note: The `updateLock` would be acquired.
+				///
+				/// - returns: `true` if the attempt succeeds. `false` otherwise.
+				@inline(__always)
+				func tryTerminate() -> Bool {
+					// Acquire `updateLock`. If the termination has still not yet been
+					// handled, take it over and bump the status to `terminated`.
+					signal.updateLock.lock()
+
+					if case let .terminating(state) = signal.state {
+						signal.state = .terminated
+						signal.updateLock.unlock()
+
+						for observer in state.observers {
+							observer.action(state.event)
+						}
+
+						return true
+					}
+
+					signal.updateLock.unlock()
+					return false
+				}
+
+				if event.isTerminating {
+					// Recursive events are disallowed for `value` events, but are permitted
+					// for termination events. Specifically:
+					//
+					// - `interrupted`
+					// It can inadvertently be sent by downstream consumers as part of the
+					// `SignalProducer` mechanics.
+					//
+					// - `completed`
+					// If a downstream consumer weakly references an object, invocation of
+					// such consumer may cause a race condition with its weak retain against
+					// the last strong release of the object. If the `Lifetime` of the
+					// object is being referenced by an upstream `take(during:)`, a
+					// signal recursion might occur.
+					//
+					// So we would treat termination events specially. If it happens to
+					// occur while the `sendLock` is acquired, the observer call-out and
+					// the disposal would be delegated to the current sender, or
+					// occasionally one of the senders waiting on `sendLock`.
+					signal.updateLock.lock()
+
+					if case let .alive(state) = signal.state {
+						let newSnapshot = TerminatingState(observers: state.observers,
+																							 event: event)
+						signal.state = .terminating(newSnapshot)
+						signal.updateLock.unlock()
+
+						if sendLock.try() {
+							// Check whether the terminating state has been handled by a
+							// concurrent sender. If not, handle it.
+							let shouldDispose = tryTerminate()
+							sendLock.unlock()
+
+							if shouldDispose {
+								signal.swapDisposable()?.dispose()
+							}
+						}
+					} else {
+						signal.updateLock.unlock()
+					}
+				} else {
+					var shouldDispose = false
+
+					// The `terminating` status check is performed twice for two different
+					// purposes:
+					//
+					// 1. Within the main protected section
+					//    It guarantees that a recursive termination event sent by a
+					//    downstream consumer, is immediately processed and need not compete
+					//    with concurrent pending senders (if any).
+					//
+					//    Termination events sent concurrently may also be caught here, but
+					//    not necessarily all of them due to data races.
+					//
+					// 2. After the main protected section
+					//    It ensures the termination event sent concurrently that are not
+					//    caught by (1) due to data races would still be processed.
+					//
+					// The related PR on the race conditions:
+					// https://github.com/ReactiveCocoa/ReactiveSwift/pull/112
+
+					sendLock.lock()
+					// Start of the main protected section.
+
+					if case let .alive(state) = signal.state {
+						for observer in state.observers {
+							observer.action(event)
+						}
+
+						// Check if the status has been bumped to `terminating` due to a
+						// concurrent or a recursive termination event.
+						if case .terminating = signal.state {
+							shouldDispose = tryTerminate()
+						}
+					}
+
+					// End of the main protected section.
+					sendLock.unlock()
 
 					// Check if the status has been bumped to `terminating` due to a
-					// concurrent or a recursive termination event.
-					if case .terminating = signal.state {
+					// concurrent termination event that has not been caught in the main
+					// protected section.
+					if !shouldDispose, case .terminating = signal.state {
+						sendLock.lock()
 						shouldDispose = tryTerminate()
+						sendLock.unlock()
 					}
-				}
 
-				// End of the main protected section.
-				signal.sendLock.unlock()
-
-				// Check if the status has been bumped to `terminating` due to a
-				// concurrent termination event that has not been caught in the main
-				// protected section.
-				if !shouldDispose, case .terminating = signal.state {
-					signal.sendLock.lock()
-					shouldDispose = tryTerminate()
-					signal.sendLock.unlock()
-				}
-
-				if shouldDispose {
-					// Dispose only after notifying observers, so disposal
-					// logic is consistently the last thing to run.
-					signal.swapDisposable()?.dispose()
+					if shouldDispose {
+						// Dispose only after notifying observers, so disposal
+						// logic is consistently the last thing to run.
+						signal.swapDisposable()?.dispose()
+					}
 				}
 			}
 		}
@@ -279,8 +313,15 @@ public final class Signal<Value, Error: Swift.Error> {
 	/// - returns: A tuple of `output: Signal`, the output end of the pipe,
 	///            and `input: Observer`, the input end of the pipe.
 	public static func pipe(disposable: Disposable? = nil) -> (output: Signal, input: Observer) {
+		return pipe(serialization: .serialize, disposable: disposable)
+	}
+
+	internal static func pipe(
+		serialization: SignalSerialization,
+		disposable: Disposable? = nil
+	) -> (output: Signal, input: Observer) {
 		var observer: Observer!
-		let signal = self.init { innerObserver in
+		let signal = self.init(serialization: serialization) { innerObserver in
 			observer = innerObserver
 			return disposable
 		}
@@ -394,6 +435,16 @@ private final class TerminatingState<Value, Error: Swift.Error> {
 		self.observers = observers
 		self.event = event
 	}
+}
+
+/// Describes how `Signal` should serialize the events it received.
+internal enum SignalSerialization {
+	/// The `Signal` should serialize all the received events.
+	case serialize
+
+	/// The `Signal` assumes to have inherited the serialization from its owner,
+	/// and its event emitter would not be called concurrently.
+	case inherit
 }
 
 /// A protocol used to constraint `Signal` operators.
@@ -527,7 +578,7 @@ extension SignalProtocol {
 	///
 	/// - returns: A signal that will send new values.
 	public func map<U>(_ transform: @escaping (Value) -> U) -> Signal<U, Error> {
-		return Signal { observer in
+		return Signal(serialization: .inherit) { observer in
 			return self.observe { event in
 				observer.action(event.map(transform))
 			}
@@ -542,7 +593,7 @@ extension SignalProtocol {
 	///
 	/// - returns: A signal that will send new type of errors.
 	public func mapError<F>(_ transform: @escaping (Error) -> F) -> Signal<Value, F> {
-		return Signal { observer in
+		return Signal(serialization: .inherit) { observer in
 			return self.observe { event in
 				observer.action(event.mapError(transform))
 			}
@@ -558,7 +609,7 @@ extension SignalProtocol {
 	/// - returns: A signal that will send only the values passing the given
 	///            predicate.
 	public func filter(_ predicate: @escaping (Value) -> Bool) -> Signal<Value, Error> {
-		return Signal { observer in
+		return Signal(serialization: .inherit) { observer in
 			return self.observe { (event: Event<Value, Error>) -> Void in
 				guard let value = event.value else {
 					observer.action(event)
@@ -595,7 +646,7 @@ extension SignalProtocol {
 	public func take(first count: Int) -> Signal<Value, Error> {
 		precondition(count >= 0)
 
-		return Signal { observer in
+		return Signal(serialization: .inherit) { observer in
 			if count == 0 {
 				observer.sendCompleted()
 				return nil
@@ -725,7 +776,7 @@ extension SignalProtocol {
 	///            `self` completes, forwards them as a single array and
 	///            complets.
 	public func collect(_ predicate: @escaping (_ values: [Value]) -> Bool) -> Signal<[Value], Error> {
-		return Signal { observer in
+		return Signal(serialization: .inherit) { observer in
 			let state = CollectState<Value>()
 
 			return self.observe { event in
@@ -790,7 +841,7 @@ extension SignalProtocol {
 	///            predicate which matches the values collected and the next
 	///            value.
 	public func collect(_ predicate: @escaping (_ values: [Value], _ value: Value) -> Bool) -> Signal<[Value], Error> {
-		return Signal { observer in
+		return Signal(serialization: .inherit) { observer in
 			let state = CollectState<Value>()
 
 			return self.observe { event in
@@ -823,7 +874,10 @@ extension SignalProtocol {
 	///
 	/// - returns: A signal that will yield `self` values on provided scheduler.
 	public func observe(on scheduler: SchedulerProtocol) -> Signal<Value, Error> {
-		return Signal { observer in
+		// While `observe` is an asynchronous operator, the resulting signal can
+		// inherit the serialization from the scheduler, since all the events
+		// are being forwarded through it.
+		return Signal(serialization: .inherit) { observer in
 			return self.observe { event in
 				scheduler.schedule {
 					observer.action(event)
@@ -841,33 +895,27 @@ private final class CombineLatestState<Value> {
 extension SignalProtocol {
 	private func observeWithStates<U>(_ signalState: CombineLatestState<Value>, _ otherState: CombineLatestState<U>, _ lock: NSLock, _ observer: Signal<(), Error>.Observer) -> Disposable? {
 		return self.observe { event in
+			lock.lock()
 			switch event {
 			case let .value(value):
-				lock.lock()
-
 				signalState.latestValue = value
 				if otherState.latestValue != nil {
 					observer.send(value: ())
 				}
 
-				lock.unlock()
-
 			case let .failed(error):
 				observer.send(error: error)
 
 			case .completed:
-				lock.lock()
-
 				signalState.isCompleted = true
 				if otherState.isCompleted {
 					observer.sendCompleted()
 				}
 
-				lock.unlock()
-
 			case .interrupted:
 				observer.sendInterrupted()
 			}
+			lock.unlock()
 		}
 	}
 
@@ -886,7 +934,9 @@ extension SignalProtocol {
 	/// - returns: A signal that will yield a tuple containing values of `self`
 	///            and given signal.
 	public func combineLatest<U>(with other: Signal<U, Error>) -> Signal<(Value, U), Error> {
-		return Signal { observer in
+		// The signal inherits the serialization from the lock, as all the events
+		// emitted happen within the lock's proected section.
+		return Signal(serialization: .inherit) { observer in
 			let lock = NSLock()
 			lock.name = "org.reactivecocoa.ReactiveSwift.combineLatestWith"
 
@@ -922,7 +972,10 @@ extension SignalProtocol {
 	public func delay(_ interval: TimeInterval, on scheduler: DateSchedulerProtocol) -> Signal<Value, Error> {
 		precondition(interval >= 0)
 
-		return Signal { observer in
+		// While `delay` is an asynchronous operator, the resulting signal can
+		// inherit the serialization from the scheduler, since all the events are
+		// forwarded through it.
+		return Signal(serialization: .inherit) { observer in
 			return self.observe { event in
 				switch event {
 				case .failed, .interrupted:
@@ -954,7 +1007,7 @@ extension SignalProtocol {
 			return signal
 		}
 
-		return Signal { observer in
+		return Signal(serialization: .inherit) { observer in
 			var skipped = 0
 
 			return self.observe { event in
@@ -979,7 +1032,7 @@ extension SignalProtocol {
 	///
 	/// - returns: A signal that sends events as its values.
 	public func materialize() -> Signal<Event<Value, Error>, NoError> {
-		return Signal { observer in
+		return Signal(serialization: .inherit) { observer in
 			return self.observe { event in
 				observer.send(value: event)
 
@@ -1004,7 +1057,7 @@ extension SignalProtocol where Value: EventProtocol, Error == NoError {
 	///
 	/// - returns: A signal that sends values carried by `self` events.
 	public func dematerialize() -> Signal<Value.Value, Value.Error> {
-		return Signal<Value.Value, Value.Error> { observer in
+		return Signal<Value.Value, Value.Error>(serialization: .inherit) { observer in
 			return self.observe { event in
 				switch event {
 				case let .value(innerEvent):
@@ -1048,7 +1101,7 @@ extension SignalProtocol {
 		disposed: (() -> Void)? = nil,
 		value: ((Value) -> Void)? = nil
 	) -> Signal<Value, Error> {
-		return Signal { observer in
+		return Signal(serialization: .inherit) { observer in
 			let disposable = CompositeDisposable()
 
 			_ = disposed.map(disposable.add)
@@ -1379,7 +1432,7 @@ extension SignalProtocol {
 	/// - returns: A signal that sends accumulated value each time `self` emits
 	///            own value.
 	public func scan<U>(_ initial: U, _ combine: @escaping (U, Value) -> U) -> Signal<U, Error> {
-		return Signal { observer in
+		return Signal(serialization: .inherit) { observer in
 			var accumulator = initial
 
 			return self.observe { event in
@@ -1443,7 +1496,7 @@ extension SignalProtocol {
 	///
 	/// - returns: A signal that sends only forwarded values from `self`.
 	public func skip(while predicate: @escaping (Value) -> Bool) -> Signal<Value, Error> {
-		return Signal { observer in
+		return Signal(serialization: .inherit) { observer in
 			var shouldSkip = true
 
 			return self.observe { event in
@@ -1506,7 +1559,7 @@ extension SignalProtocol {
 	/// - returns: A signal that receives up to `count` values from `self`
 	///            after `self` completes.
 	public func take(last count: Int) -> Signal<Value, Error> {
-		return Signal { observer in
+		return Signal(serialization: .inherit) { observer in
 			var buffer: [Value] = []
 			buffer.reserveCapacity(count)
 
@@ -1545,7 +1598,7 @@ extension SignalProtocol {
 	/// - returns: A signal that sends events until the values sent by `self`
 	///            pass the given `predicate`.
 	public func take(while predicate: @escaping (Value) -> Bool) -> Signal<Value, Error> {
-		return Signal { observer in
+		return Signal(serialization: .inherit) { observer in
 			return self.observe { event in
 				if let value = event.value, !predicate(value) {
 					observer.sendCompleted()
@@ -1676,7 +1729,10 @@ extension SignalProtocol {
 	public func throttle(_ interval: TimeInterval, on scheduler: DateSchedulerProtocol) -> Signal<Value, Error> {
 		precondition(interval >= 0)
 
-		return Signal { observer in
+		// While `throttle` is an asynchronous operator, the resulting signal can
+		// inherit the serialization from the scheduler, since all events are being
+		// forwarded through it.
+		return Signal(serialization: .inherit) { observer in
 			let state: Atomic<ThrottleState<Value>> = Atomic(ThrottleState())
 			let schedulerDisposable = SerialDisposable()
 
@@ -1869,7 +1925,7 @@ extension SignalProtocol {
 	///
 	/// - returns: A signal that sends unique values during its lifetime.
 	public func uniqueValues<Identity: Hashable>(_ transform: @escaping (Value) -> Identity) -> Signal<Value, Error> {
-		return Signal { observer in
+		return Signal(serialization: .inherit) { observer in
 			var seenValues: Set<Identity> = []
 			
 			return self
@@ -2145,7 +2201,7 @@ extension SignalProtocol where Error == NoError {
 	///
 	/// - returns: A signal that has an instantiatable `ErrorType`.
 	public func promoteErrors<F: Swift.Error>(_: F.Type) -> Signal<Value, F> {
-		return Signal { observer in
+		return Signal(serialization: .inherit) { observer in
 			return self.observe { event in
 				switch event {
 				case let .value(value):
