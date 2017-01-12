@@ -19,7 +19,10 @@ import Result
 public struct SignalProducer<Value, Error: Swift.Error> {
 	public typealias ProducedSignal = Signal<Value, Error>
 
-	fileprivate let startHandler: () -> (signal: Signal<Value, Error>, () -> Void, Disposable)
+	/// The creation of the `Signal` graph is decoupled from the invocation of the
+	/// starting side effect. This allows `lift` to compose at the level of
+	/// `Signal`s directly, and dodge the need of extra relaying signals.
+	fileprivate let startHandler: () -> (signal: Signal<Value, Error>, start: () -> Void, interrupter: Disposable)
 
 	/// Initializes a `SignalProducer` that will emit the same events as the
 	/// given signal.
