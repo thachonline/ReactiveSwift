@@ -13,11 +13,12 @@ public final class Action<Input, Output, Error: Swift.Error> {
 	private let deinitToken: Lifetime.Token
 
 	private let executeClosure: (_ state: Any, _ input: Input) -> SignalProducer<Output, Error>
-	private let eventsObserver: Signal<Event<Output, Error>, NoError>.Observer
 	private let disabledErrorsObserver: Signal<(), NoError>.Observer
 
 	/// The lifetime of the Action.
 	public let lifetime: Lifetime
+
+	private let dispatcher: (SignalProducer<Output, Error>) -> Void
 
 	/// A signal of all events generated from applications of the Action.
 	///
@@ -52,7 +53,10 @@ public final class Action<Input, Output, Error: Swift.Error> {
 	/// Whether the action is currently enabled.
 	public let isEnabled: Property<Bool>
 
+	private let strategy: FlattenStrategy
+
 	private let state: MutableProperty<ActionState>
+	private let disablesWhenExecuting: Bool
 
 	/// Initializes an action that will be conditionally enabled based on the
 	/// value of `state`. Creates a `SignalProducer` for each input and the
@@ -75,23 +79,31 @@ public final class Action<Input, Output, Error: Swift.Error> {
 	///   - execute: A closure that returns the `SignalProducer` returned by
 	///              calling `apply(Input)` on the action, optionally using
 	///              the current value of `state`.
-	public init<State: PropertyProtocol>(state property: State, enabledIf isEnabled: @escaping (State.Value) -> Bool, _ execute: @escaping (State.Value, Input) -> SignalProducer<Output, Error>) {
+	public init<State: PropertyProtocol>(state property: State, enabledIf isEnabled: @escaping (State.Value) -> Bool, strategy: FlattenStrategy = .concat, disablesWhenExecuting: Bool = true, _ execute: @escaping (State.Value, Input) -> SignalProducer<Output, Error>) {
 		deinitToken = Lifetime.Token()
 		lifetime = Lifetime(deinitToken)
-		
-		// Retain the `property` for the created `Action`.
-		lifetime.observeEnded { _ = property }
 
 		executeClosure = { state, input in execute(state as! State.Value, input) }
 
-		(events, eventsObserver) = Signal<Event<Output, Error>, NoError>.pipe()
+		let (producers, producersObserver) = Signal<SignalProducer<Event<Output, Error>, NoError>, NoError>.pipe()
+		events = producers.flatten(strategy)
+		dispatcher = { producersObserver.send(value: $0.materialize()) }
+
 		(disabledErrors, disabledErrorsObserver) = Signal<(), NoError>.pipe()
+
+		// Retain the `property` for the created `Action`.
+		lifetime.observeEnded { [disabledErrorsObserver] in
+			_ = property
+
+			producersObserver.sendCompleted()
+			disabledErrorsObserver.sendCompleted()
+		}
 
 		values = events.filterMap { $0.value }
 		errors = events.filterMap { $0.error }
 		completed = events.filter { $0.isCompleted }.map { _ in }
 
-		let initial = ActionState(value: property.value, isEnabled: { isEnabled($0 as! State.Value) })
+		let initial = ActionState(value: property.value, isEnabled: { isEnabled($0 as! State.Value) }, disablesWhenExecuting: disablesWhenExecuting)
 		state = MutableProperty(initial)
 
 		property.signal
@@ -104,6 +116,9 @@ public final class Action<Input, Output, Error: Swift.Error> {
 
 		self.isEnabled = state.map { $0.isEnabled }.skipRepeats()
 		self.isExecuting = state.map { $0.isExecuting }.skipRepeats()
+
+		self.strategy = strategy
+		self.disablesWhenExecuting = disablesWhenExecuting
 	}
 
 	/// Initializes an action that will be conditionally enabled, and creates a
@@ -128,11 +143,6 @@ public final class Action<Input, Output, Error: Swift.Error> {
 	///              calling `apply(Input)` on the action.
 	public convenience init(_ execute: @escaping (Input) -> SignalProducer<Output, Error>) {
 		self.init(enabledIf: Property(value: true), execute)
-	}
-
-	deinit {
-		eventsObserver.sendCompleted()
-		disabledErrorsObserver.sendCompleted()
 	}
 
 	/// Creates a SignalProducer that, when started, will execute the action
@@ -163,14 +173,18 @@ public final class Action<Input, Output, Error: Swift.Error> {
 				return
 			}
 
-			self.executeClosure(state, input).startWithSignal { signal, signalDisposable in
-				disposable += signalDisposable
-
-				signal.observe { event in
-					observer.action(event.mapError(ActionError.producerFailed))
-					self.eventsObserver.send(value: event)
+			self.dispatcher(
+				SignalProducer { workerObserver, workerDisposable in
+					self.executeClosure(state, input)
+						.startWithSignal { signal, interrupter in
+							workerDisposable += signal.observe { event in
+								workerObserver.action(event)
+								observer.action(event.mapError(ActionError.producerFailed))
+							}
+							disposable += interrupter
+						}
 				}
-			}
+			)
 
 			disposable += {
 				self.state.modify {
@@ -182,6 +196,7 @@ public final class Action<Input, Output, Error: Swift.Error> {
 }
 
 private struct ActionState {
+	let disablesWhenExecuting: Bool
 	var isExecuting: Bool = false
 
 	var value: Any {
@@ -193,16 +208,17 @@ private struct ActionState {
 	private var userEnabled: Bool
 	private let userEnabledClosure: (Any) -> Bool
 
-	init(value: Any, isEnabled: @escaping (Any) -> Bool) {
+	init(value: Any, isEnabled: @escaping (Any) -> Bool, disablesWhenExecuting: Bool) {
 		self.value = value
 		self.userEnabled = isEnabled(value)
 		self.userEnabledClosure = isEnabled
+		self.disablesWhenExecuting = disablesWhenExecuting
 	}
 
 	/// Whether the action should be enabled for the given combination of user
 	/// enabledness and executing status.
 	fileprivate var isEnabled: Bool {
-		return userEnabled && !isExecuting
+		return userEnabled && (!disablesWhenExecuting || !isExecuting)
 	}
 }
 
@@ -238,7 +254,7 @@ public protocol ActionProtocol: BindingTargetProvider, BindingTargetProtocol {
 	///   - execute: A closure that returns the `SignalProducer` returned by
 	///              calling `apply(Input)` on the action, optionally using
 	///              the current value of `state`.
-	init<State: PropertyProtocol>(state property: State, enabledIf isEnabled: @escaping (State.Value) -> Bool, _ execute: @escaping (State.Value, Input) -> SignalProducer<Output, Error>)
+	init<State: PropertyProtocol>(state property: State, enabledIf isEnabled: @escaping (State.Value) -> Bool, strategy: FlattenStrategy, disablesWhenExecuting: Bool, _ execute: @escaping (State.Value, Input) -> SignalProducer<Output, Error>)
 
 	/// Whether the action is currently enabled.
 	var isEnabled: Property<Bool> { get }
@@ -281,8 +297,8 @@ extension ActionProtocol where Input == Void {
 	///            whenever the value is `nil`.
 	///   - execute: A closure to return a new `SignalProducer` based on the
 	///              current value of `input`.
-	public init<P: PropertyProtocol, T>(input: P, _ execute: @escaping (T) -> SignalProducer<Output, Error>) where P.Value == T? {
-		self.init(state: input, enabledIf: { $0 != nil }) { input, _ in
+	public init<P: PropertyProtocol, T>(input: P, strategy: FlattenStrategy = .concat, disablesWhenExecuting: Bool = true, _ execute: @escaping (T) -> SignalProducer<Output, Error>) where P.Value == T? {
+		self.init(state: input, enabledIf: { $0 != nil }, strategy: strategy, disablesWhenExecuting: disablesWhenExecuting) { input, _ in
 			execute(input!)
 		}
 	}
@@ -295,8 +311,8 @@ extension ActionProtocol where Input == Void {
 	///            whenever the action is executed.
 	///   - execute: A closure to return a new `SignalProducer` based on the
 	///              current value of `input`.
-	public init<P: PropertyProtocol, T>(input: P, _ execute: @escaping (T) -> SignalProducer<Output, Error>) where P.Value == T {
-		self.init(input: input.map(Optional.some), execute)
+	public init<P: PropertyProtocol, T>(input: P, strategy: FlattenStrategy = .concat, disablesWhenExecuting: Bool = true, _ execute: @escaping (T) -> SignalProducer<Output, Error>) where P.Value == T {
+		self.init(input: input.map(Optional.some), strategy: strategy, disablesWhenExecuting: disablesWhenExecuting, execute)
 	}
 }
 
